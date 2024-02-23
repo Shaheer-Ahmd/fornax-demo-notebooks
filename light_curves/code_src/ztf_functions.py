@@ -48,9 +48,15 @@ def ztf_get_lightcurves(sample_table, *, nworkers=6, match_radius=1/3600):
     # the catalog is in parquet format with one file per ZTF filter, field, ccd, and quadrant
     # use a TAP query to locate which files each object is in
     locations_df = locate_objects(sample_table, match_radius)
+    locpath = "~/.ztf/locations-SDSS-500k.parquet"
+    locations_df.to_parquet(locpath)
+    print(f"saved {locpath}", flush=True)
 
     # the catalog is stored in an AWS S3 bucket. loop over the files and load the light curves
     ztf_df = load_lightcurves(locations_df, nworkers=nworkers)
+    lcpath = "~/.ztf/lightcurves-SDSS-500k.parquet"
+    ztf_df.to_parquet(lcpath)
+    print(f"saved {lcpath}", flush=True)
 
     # if none of the objects were found, the transform_lightcurves function will raise a ValueError
     # so return an empty dataframe now instead of proceeding
@@ -61,6 +67,7 @@ def ztf_get_lightcurves(sample_table, *, nworkers=6, match_radius=1/3600):
     ztf_df = transform_lightcurves(ztf_df)
 
     # return the light curves as a MultiIndexDFObject
+    print(f"{bulk_run.helper._now()} | starting MultiIndexDFObject", flush=True)
     indexes, columns = ["objectid", "label", "band", "time"], ["flux", "err"]
     return MultiIndexDFObject(data=ztf_df.set_index(indexes)[columns].sort_index())
 
@@ -276,10 +283,11 @@ def transform_lightcurves(ztf_df):
     """
     # ztf_df might have more than one light curve per (band + objectid) if the ra/dec is close
     # to a CCD-quadrant boundary (Sanchez-Saez et al., 2021). keep the one with the most datapoints
-    ztf_df_list = []
+    print(f"{bulk_run.helper._now()} | starting indexes_to_keep", flush=True)
+    indexes_to_keep = []
     for _, singleband_object in ztf_df.groupby(["objectid", "band"]):
         if len(singleband_object.index) == 1:
-            ztf_df_list.append(singleband_object)
+            indexes_to_keep.extend(singleband_object.index)
         else:
             npoints = singleband_object["mag"].str.len()
             npointsmax_object = singleband_object.loc[npoints == npoints.max()]
@@ -288,26 +296,61 @@ def transform_lightcurves(ztf_df):
             # arbitrarily pick the one with the min oid.
             # depending on your science, you may want (e.g.,) the largest timespan instead
             if len(npointsmax_object.index) == 1:
-                ztf_df_list.append(npointsmax_object)
+                indexes_to_keep.extend(npointsmax_object.index)
             else:
                 minoid = npointsmax_object.oid.min()
-                ztf_df_list.append(npointsmax_object.loc[npointsmax_object.oid == minoid])
-
-    ztf_df = pd.concat(ztf_df_list, ignore_index=True)
-
+                indexes_to_keep.extend(npointsmax_object.loc[npointsmax_object.oid == minoid].index)
+            # indexes_to_keep.append(npointsmax_object.sort_values("oid").iloc[0].name)
+    ztf_df = ztf_df.loc[sorted(indexes_to_keep)]
+    # ztf_df = pd.concat(ztf_df_list, ignore_index=True)  # +4g
+    # del ztf_df_list  # -.5g
+    
     # store "hmjd" as "time".
     # note that other light curves in this notebook will have "time" as MJD instead of HMJD.
     # if your science depends on precise times, this will need to be corrected.
-    ztf_df = ztf_df.rename(columns={"hmjd": "time"})
+    print(f"{bulk_run.helper._now()} | starting rename", flush=True)
+    ztf_df = ztf_df.rename(columns={"hmjd": "time"})  # 0g
 
     # "explode" the data structure into one row per light curve point and set the correct dtypes
+    # start: 14.5gRES 15.8gused
+    # killed (64g machine)
+    print(f"{bulk_run.helper._now()} | starting explode", flush=True)
     ztf_df = ztf_df.explode(["time", "mag", "magerr", "catflags"], ignore_index=True)
     ztf_df = ztf_df.astype({"time": "float", "mag": "float", "magerr": "float", "catflags": "int"})
 
+    # import numpy as np
+    # # now we need to save space
+    # # we don't need the oid anymore, so drop it
+    # # ztf_df = ztf_df[[c for c in ztf_df.columns if c != "oid"]]
+    # del ztf_df["oid"]
+    # # try to use a smaller dtype for the objectid
+    # if np.iinfo('int32').max > ztf_df.objectid.max():
+    #     ztf_df = ztf_df.astype({"objectid": "int32"})
+
+    # import pyarrow as pa
+    # import pyarrow.compute as pc
+    # def explode_table(table, column):
+    #     null_filled = pc.fill_null(table[column], [None])
+    #     flattened = pc.list_flatten(null_filled)
+    #     other_columns = list(table.schema.names)
+    #     other_columns.remove(column)
+    #     if len(other_columns) == 0:
+    #         return pa.table({column: flattened})
+    #     else:
+    #         indices = pc.list_parent_indices(null_filled)
+    #         result = table.select(other_columns).take(indices)
+    #         result = result.append_column(
+    #             pa.field(column, table.schema.field(column).type.value_type),
+    #             flattened,
+    #         )
+    #         return result 
+
     # remove data flagged as bad
+    print(f"{bulk_run.helper._now()} | starting catflags", flush=True)
     ztf_df = ztf_df.loc[ztf_df["catflags"] < 32768, :]
 
     # calc flux [https://arxiv.org/pdf/1902.01872.pdf zeropoint corrections already applied]
+    print(f"{bulk_run.helper._now()} | starting flux", flush=True)
     mag = ztf_df["mag"].to_numpy()
     magerr = ztf_df["magerr"].to_numpy()
     fluxupper = ((mag - magerr) * u.ABmag).to_value('mJy')
@@ -315,4 +358,5 @@ def transform_lightcurves(ztf_df):
     ztf_df["flux"] = (mag * u.ABmag).to_value('mJy')
     ztf_df["err"] = (fluxupper - fluxlower) / 2
 
+    print(f"{bulk_run.helper._now()} | done transform_lightcurves", flush=True)
     return ztf_df
