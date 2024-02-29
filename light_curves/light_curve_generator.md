@@ -334,74 +334,7 @@ end_serial = time.time()
 print('total time for serial archive calls is ', end_serial - start_serial, 's')
 ```
 
-## 4. Parallel processing the archive calls
-
-```{code-cell} ipython3
-# number of workers to use in the parallel processing pool
-# this should equal the total number of archives called
-n_workers = 8
-```
-
-```{code-cell} ipython3
-# we'll use the default keyword arguments for all archives except ZTF
-# we must turn off the ZTF internal parallelization because it is incompatible with the pool launched below
-ztf_kwargs = {"nworkers": None}
-
-# note that the ZTF call is relatively slow compared to other archives.
-# if you want to query for a large number of objects, it will be faster to call ZTF individually
-# (code above) and use the internal parallelization. try 8-12 workers.
-```
-
-```{code-cell} ipython3
-parallel_starttime = time.time()
-
-# start a multiprocessing pool and run all the archive queries
-parallel_df_lc = MultiIndexDFObject()  # to collect the results
-callback = parallel_df_lc.append  # will be called once on the result returned by each archive
-with mp.Pool(processes=n_workers) as pool:
-
-    # start the processes that call the archives
-    pool.apply_async(gaia_get_lightcurves, args=(sample_table,), callback=callback)
-    pool.apply_async(heasarc_get_lightcurves, args=(sample_table,), callback=callback)
-    pool.apply_async(hcv_get_lightcurves, args=(sample_table,), callback=callback)
-    pool.apply_async(icecube_get_lightcurves, args=(sample_table,), callback=callback)
-    pool.apply_async(panstarrs_get_lightcurves, args=(sample_table,), callback=callback)
-    pool.apply_async(tess_kepler_get_lightcurves, args=(sample_table,), callback=callback)
-    pool.apply_async(wise_get_lightcurves, args=(sample_table,), callback=callback)
-    pool.apply_async(ztf_get_lightcurves, args=(sample_table,), kwds=ztf_kwargs, callback=callback)
-
-    pool.close()  # signal that no more jobs will be submitted to the pool
-    pool.join()  # wait for all jobs to complete, including the callback
-
-parallel_endtime = time.time()
-
-# LightKurve will return an "Error" when it doesn't find a match for a target
-# These are not real errors and can be safely ignored.
-```
-
-```{code-cell} ipython3
-# How long did parallel processing take?
-# and look at the results
-print('parallel processing took', parallel_endtime - parallel_starttime, 's')
-parallel_df_lc.data
-```
-
-```{code-cell} ipython3
-# Save the data for future use with ML notebook
-#parquet_savename = 'output/df_lc_090723_yang.parquet'
-#parallel_df_lc.data.to_parquet(parquet_savename)
-#print("file saved!")
-```
-
-```{code-cell} ipython3
-# Could load a previously saved file in order to plot
-#parquet_loadname = 'output/df_lc_090723_yang.parquet'
-#parallel_df_lc = MultiIndexDFObject()
-#parallel_df_lc.data = pd.read_parquet(parquet_loadname)
-#print("file loaded!")
-```
-
-## 5. Make plots of luminosity as a function of time
+## 4. Make plots of luminosity as a function of time
 These plots are modelled after [van Velzen et al., 2021](https://arxiv.org/pdf/2111.09391.pdf). We show flux in mJy as a function of time for all available bands for each object. `show_nbr_figures` controls how many plots are actually generated and returned to the screen.  If you choose to save the plots with `save_output`, they will be put in the output directory and labelled by sample number.
 
 __Note__ that in the following, we can either plot the results from `df_lc` (from the serial call) or `parallel_df_lc` (from the parallel call). By default (see next cell) the output of the parallel call is used.
@@ -411,6 +344,246 @@ _ = create_figures(df_lc = parallel_df_lc, # either df_lc (serial call) or paral
                    show_nbr_figures = 5,  # how many plots do you actually want to see?
                    save_output = True ,  # should the resulting plots be saved?
                   )
+```
+
+## 5. Parallel processing the archive calls
+
+The archive calls can run in parallel.
+This may be convenient for samples of any size, but particularly helpful for those larger than about 1,000.
+Larger runs come with different challenges, and this is complicated by the fact that different combinations of samples and archive calls can trigger different issues.
+
+The code_src contains a "helper" module to facilitate these runs.
+It can be used in combination with any parallel processing method.
+
+This section contains three examples of using the helper, and covers the following parallelization methods:
+
+- Python's `multiprocessing` library. Useful as a demonstration. May be convenient for runs with small to medium sample sizes.
+- Command-line script. Recommended for most runs with medium to large samples. Allows ZTF to use additional parallelization internally, and so is often faster (ZTF often takes the longest and returns the most data for AGN-like samples). Writes stdout and stderr to log files, useful for monitoring jobs and resource usage. Can monitor and record `top` to help identify CPU and RAM usage/needs.
+
+**Code for the command-line script is shown in non-executable cells.**
+To run it, open a new terminal and copy/paste the cell text.
+Also be aware that the script path shown in these cells assumes you are in the same directory as this notebook. Adjust it if needed.
+
+```{code-cell} ipython3
+# this section can be run independently using these imports
+import json
+import multiprocessing
+import pandas as pd
+import sys
+
+sys.path.append("code_src/")
+import bulk_run.helper
+from data_structures import MultiIndexDFObject
+from plot_functions import create_figures
+```
+
+### Parallel: Example 1
+
+This is a basic example of the end-to-end process.
+It uses python `multiprocessing` for parallelization and the defaults for most options.
+
+Define basic keyword arguments ("kwargs") for the run:
+
+```{code-cell} ipython3
+kwargs_dict = {
+    # run_id. Will be used to name the base directory that will be created/used for this run.
+    "run_id": "basic-example",
+    # Paper names to gather the sample from. Will use default keyword arguments for get_*_sample function calls.
+    "get_samples": ["Hon"],
+    # Keyword arguments for *_get_lightcurves archive calls. Will use defaults for all except ZTF where we must
+    # turn off the internal parallelization because it cannot be combined with a `multiprocessing.Pool`.
+    "archives": {"ZTF": {"nworkers": None}},
+}
+kwargs_dict
+```
+
+Decide which archives to query.
+This is a separate list because the helper can only run one archive call at a time.
+We will iterate over this list and launch each job separately.
+
+```{code-cell} ipython3
+archive_names = bulk_run.helper.ARCHIVE_NAMES["core"]  # predefined list ("core" or "all")
+# archive_names = ["Gaia", "WISE"]  # choose your own list
+archive_names
+```
+
+Collect the sample and write it as a .ecsv file:
+
+```{code-cell} ipython3
+sample_table = bulk_run.helper.run(build="sample", **kwargs_dict)
+# sample_table is returned if you want to look at it but it is not used below
+```
+
+Query the archives in parallel using a `multiprocessing.Pool`:
+
+```{code-cell} ipython3
+with multiprocessing.Pool(processes=len(archive_names)) as pool:
+    # submit one job per archive
+    for archive in archive_names:
+        pool.apply_async(bulk_run.helper.run, kwds={"build": "lightcurves", "archive": archive, **kwargs_dict})
+    pool.close()  # signal that no more jobs will be submitted to the pool
+    pool.join()  # wait for all jobs to complete
+
+# Note: The console output from different archive calls gets jumbled together below.
+# Worse, error messages tend to get lost in the background and never displayed.
+# If you have trouble, consider running an archive call individually without the Pool
+# or using the command-line script instead.
+```
+
+The light curve data is saved as a parquet dataset in the "parquet_dir" directory.
+Load it:
+
+```{code-cell} ipython3
+# copy/paste the directory path from the output above, or ask the helper for it like this:
+parquet_dir = bulk_run.helper.run(build="parquet_dir", **kwargs_dict)
+df_lc = pd.read_parquet(parquet_dir)
+
+df_lc.head()
+```
+
+Now we can make figures:
+
+```{code-cell} ipython3
+_ = create_figures(df_lc=MultiIndexDFObject(data=df_lc), show_nbr_figures=1, save_output=False)
+```
+
+### Parallel: Example 2
+
+This example shows the `kwargs_dict` options in more detail.
+A basic introduction to the command-line script is also given at the end.
+
+`kwargs_dict` can contain:
+  &bull; keyword arguments for any of the `get_*_sample` functions.
+  &bull; keyword arguments for any of the `*_get_lightcurves` functions.
+  &bull; keyword arguments used directly by the helper. These options and their defaults are shown below, further documented in the helper's `run` function. 
+
+```{code-cell} ipython3
+bulk_run.helper.DEFAULTS
+```
+
+It can be convenient to save the parameters in a yaml file, especially when using the command-line script or in cases where you want to store them for later reference or re-use.
+
+Define parameters for a run with a diverse sample and custom kwargs for the archive calls, and save it as a yaml file:
+
+```{code-cell} ipython3
+run_id = "extended-example"  # we'll need to use the same run_id in several steps
+
+get_samples = {
+    "green": {},
+    "ruan": {},
+    "papers_list": {
+        "paper_kwargs": [
+            {"paper_link": "2022ApJ...933...37W", "label": "Galex variable 22"},
+            {"paper_link": "2020ApJ...896...10B", "label": "Palomar variable 20"},
+        ]
+    },
+    "SDSS": {"num": 10, "zmin": 0.5, "zmax": 2, "randomize_z": True},
+    "ZTF_objectid": {"objectids": ["ZTF18aabtxvd", "ZTF18aahqkbt", "ZTF18abxftqm", "ZTF18acaqdaa"]},
+}
+
+archives = {
+    "Gaia": {"search_radius": 2 / 3600},
+    "HEASARC": {"catalog_error_radii": {"FERMIGTRIG": 1.0, "SAXGRBMGRB": 3.0}},
+    "IceCube": {"icecube_select_topN": 4, "max_search_radius": 2.0},
+    "WISE": {"radius": 1.5, "bandlist": ["W1", "W2"]},
+    "ZTF": {"nworkers": 6, "match_radius": 2 / 3600},
+}
+
+kwargs_dict = {
+    "get_samples": get_samples,
+    "consolidate_nearby_objects": False,
+    "archives": archives,
+}
+
+bulk_run.helper.write_kwargs_to_yaml(run_id=run_id, **kwargs_dict)
+```
+
+The path to the yaml file is printed in the output above.
+You can alter the contents of the file as you like.
+
+To use the file with the python commands shown in the previous example, set the kwarg `use_yaml=True`.
+Be sure to use the same `run_id` as when writing the yaml.
+Here's an example for the "sample" step:
+
+```{code-cell} ipython3
+sample_table = bulk_run.helper.run(build="sample", run_id=run_id, use_yaml=True)
+```
+
+To use the file with the command-line script, the basic call is:
+
+```{raw-cell}
+run_id=extended-example  # use the same run_id as when writing the yaml
+./code_src/bulk_run/light_curve_generator.sh -r "$run_id" -d "use_yaml=true" -a "core"
+```
+
+The flags used in the call above are:
+
+- `-r` (run_id)
+- `-d` (dict). Any top-level item in kwargs_dict (syntax: "key=value") whose value is a basic type (e.g., bool or string but not list or dict.) Repeat the flag to send multiple kwargs.
+- `-a` (archive_names). "all", "core", or space-separated list of names like "Gaia IceCube WISE"
+
+### Parallel: Example 3
+
+This example shows how to launch and monitor a large-scale job using the command-line script.
+
+light_curve_generator.sh is a command-line script that can be used to execute a complete run with one call, including sample collection and running the archive calls in parallel.
+This method is more powerful than python `multiprocessing` and is recommended for larger runs and/or when you need to monitor a run more closely for errors, RAM and CPU usage, etc.
+
+The previous example showed how to submit kwargs with a yaml file, which is convenient for an extended set of kwargs.
+However, large-scale jobs don't always require such extensive parameter definitions.
+In such cases, it can be more convenient to submit kwargs as a json string.
+Python can be used to construct the string:
+
+```{code-cell} ipython3
+kwargs_dict = {
+    "get_samples": {"SDSS": {"num": 500_000}},  # 500,000 sample objects = very large-scale run
+    "archives": {"ZTF": {"nworkers": 8}}  # around 8 ZTF workers is often good, but monitor resource usage
+}
+json.dumps(kwargs_dict)
+```
+
+Copy the json string output above, including the surrounding single quotes ('), and use it to launch a run with the `-j` flag like this:
+
+```{raw-cell}
+# This run will require a minimum of 4 CPU and 100G RAM, and should complete in about 5-10 hours.
+./code_src/bulk_run/light_curve_generator.sh \
+    -r "SDSS-500k" \
+    -j '{"get_samples": {"SDSS": {"num": 500000}}, "archives": {"ZTF": {"nworkers": 8}}}' \
+    -a "core"
+```
+
+The script will gather the sample, launch the archive calls in parallel, then exit.
+Archive jobs will continue running in the background until they either complete or encounter an error.
+
+You can cancel the run at any time.
+If the script is still running, press `Control-C`.
+If the script has exited, call it again with the `-k` flag to kill all processes (jobs) that were launched:
+
+```{raw-cell}
+# This will kill all processes that were started by the run with the given run_id.
+./code_src/bulk_run/light_curve_generator.sh -r "SDSS-500k" -k
+```
+
+There are multiple ways to monitor the run, including:
+- Check the logs for job status or errors. The script will redirect stdout and stderr to files and print out the paths for you.
+- Check for parquet (light curve) data. The script will print out the "parquet_dir". `ls` this directory. You will see a subdirectory for each archive call that has completed successfully, assuming it retrieved data for the sample.
+- Monitor resource usage with the `top` command. The script will print the job PIDs. The script can also monitor `top` for you and save the output to a log file. Use the `-t` flag as shown below:
+
+```{raw-cell}
+# This will print `top` to stdout and save it to a file once per interval.
+interval=10m  # will be passed to the `sleep` command
+./code_src/bulk_run/light_curve_generator.sh -r "SDSS-500k" -t "$interval"
+```
+
+The script will continue running until sometime after all jobs launched with the given run_id have completed.
+You can cancel at anytime with `Control-C` and start it again with a new interval.
+
+Once the `top` output has been saved, the helper can load it to pandas DataFrames:
+
+```{code-cell} ipython3
+top_summary_df, top_pid_df = bulk_run.helper.load_top_log(run_id)
+
+top_summary_df.plot("time", "used_GiB", kind="scatter")
 ```
 
 ## References
