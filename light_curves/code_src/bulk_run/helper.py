@@ -161,7 +161,7 @@ def _build_lightcurves(
     # Save and return the light curve data.
     parquet_filepath.parent.mkdir(parents=True, exist_ok=True)
     lightcurve_df.data.to_parquet(parquet_filepath)
-    print(f"Light curves saved to:\n\tparquet_dir={parquet_dir}\n\tfile={parquet_filepath.relativeto(parquet_dir)}")
+    print(f"Light curves saved to:\n\tparquet_dir={parquet_dir}\n\tfile={parquet_filepath.relative_to(parquet_dir)}")
     print(_now(), flush=True)
     return lightcurve_df
 
