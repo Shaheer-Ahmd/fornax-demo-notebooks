@@ -1,4 +1,4 @@
-#!/bin/bash
+#
 RUN_HELPER_PY(){
     build=$1
     archive=$2
@@ -254,30 +254,32 @@ echo "*********************************************************************"
 echo "**                          Run starting.                          **"
 echo "run_id=${run_id}"
 echo "base_dir=${base_dir}"
+echo "logs_dir=${logs_dir}"
+echo "parquet_dir=${parquet_dir}"
 echo "**                                                                 **"
 echo
 
 # ---- Do the run. ---- #
 
 # ---- 1: Run job to get the object sample, if needed. Wait for it to finish.
-logfile="${logs_dir}/get_sample.log"
+logfile_name="get_sample.log"
+logfile="${logs_dir}/${logfile_name}"
 echo
-echo "Build sample is starting."
-echo "logfile=${logfile}"
+echo "Build sample is starting. logfile=${logfile_name}"
 RUN_HELPER_PY sample >> ${logfile} 2>&1
 echo "Build sample is done. Printing the log for convenience:"
+echo
 print_logs $logfile
 
 # ---- 2: Start the jobs to fetch the light curves in the background. Do not wait for them to finish.
 echo
 echo "Archive calls are starting."
-echo "parquet_dir=${parquet_dir}"
 echo
 for archive in ${archive_names[@]}; do
-    logfile="${logs_dir}/$(awk '{ print tolower($0) }' <<< $archive).log"
+    logfile_name="$(awk '{ print tolower($0) }' <<< $archive).log"
+    logfile="${logs_dir}/${logfile_name}"
     RUN_HELPER_PY lightcurves $archive >> ${logfile} 2>&1
-    echo "[pid=${!}] ${archive} started."
-    echo "logfile=${logfile}"
+    echo "[pid=${!}] ${archive} started. logfile=${logfile_name}"
 done
 
 # ---- 3: Print some instructions for the user, then exit.
